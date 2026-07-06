@@ -489,3 +489,251 @@ pub(super) fn detect_scanner_ua(
     }
     incidents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("test timestamp must be valid")
+    }
+
+    fn add_runas_actions(
+        graph: &mut KnowledgeGraph,
+        user_name: &str,
+        count: u32,
+        now: DateTime<Utc>,
+    ) {
+        let user = graph.ensure_user(user_name);
+        for i in 0..count {
+            let process = graph.ensure_process(10_000 + i, 1, "recon", 1000, now);
+            graph.add_edge(Edge::new(process, user, Relation::RunAs, now));
+        }
+    }
+
+    fn add_proto_connections(
+        graph: &mut KnowledgeGraph,
+        source_ip: NodeId,
+        target_ip: NodeId,
+        count: u32,
+        summary: &str,
+        now: DateTime<Utc>,
+    ) {
+        for i in 0..count {
+            graph.add_edge(
+                Edge::new(
+                    source_ip,
+                    target_ip,
+                    Relation::ConnectedTo,
+                    now - Duration::seconds(i as i64),
+                )
+                .with_prop("summary", summary),
+            );
+        }
+    }
+
+    #[test]
+    fn detect_threat_intel_fires_for_ip_dataset_hit() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(60);
+        let process = graph.ensure_process(1234, 1, "curl", 1000, now);
+        let ip = graph.add_node(Node::Ip {
+            addr: "203.0.113.10".into(),
+            is_internal: false,
+            datasets: vec!["sslbl".into()],
+            risk_score: 90,
+            is_tor: false,
+            first_seen: now,
+            last_seen: now,
+            attempted_usernames: Vec::new(),
+        });
+        graph.add_edge(Edge::new(process, ip, Relation::ConnectedTo, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_threat_intel(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert_eq!(incidents[0].evidence["dataset"], "sslbl");
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1071"));
+    }
+
+    #[test]
+    fn detect_threat_intel_ignores_ip_without_dataset() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(60);
+        let process = graph.ensure_process(1234, 1, "curl", 1000, now);
+        let ip = graph.ensure_ip("203.0.113.11", now);
+        graph.add_edge(Edge::new(process, ip, Relation::ConnectedTo, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_threat_intel(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn detect_discovery_burst_unknown_user_threshold_fires_medium() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(100);
+        add_runas_actions(&mut graph, "unknown-user", 5, now);
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_discovery_burst_calibrated(
+            &graph,
+            &mut state,
+            "host",
+            now,
+            &CalibrationContext::default(),
+        );
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::Medium);
+        assert_eq!(incidents[0].evidence["user_class"], "unknown");
+        assert_eq!(incidents[0].evidence["exec_count"], 5);
+    }
+
+    #[test]
+    fn detect_discovery_burst_unknown_user_double_threshold_fires_high() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(100);
+        add_runas_actions(&mut graph, "unknown-user", 10, now);
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_discovery_burst_calibrated(
+            &graph,
+            &mut state,
+            "host",
+            now,
+            &CalibrationContext::default(),
+        );
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert_eq!(incidents[0].evidence["exec_count"], 10);
+    }
+
+    #[test]
+    fn detect_discovery_burst_human_user_under_adjusted_threshold_is_suppressed() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(100);
+        add_runas_actions(&mut graph, "alice", 6, now);
+        let ctx = CalibrationContext {
+            human_user_names: vec!["alice".into()],
+            ..Default::default()
+        };
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_discovery_burst_calibrated(&graph, &mut state, "host", now, &ctx);
+
+        assert!(incidents.is_empty());
+        assert_eq!(
+            state
+                .suppressed_counts
+                .get(&("discovery_burst".to_string(), "human")),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn detect_proto_anomaly_fires_medium_at_anomaly_threshold() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(200);
+        let source = graph.ensure_ip("203.0.113.20", now);
+        let target = graph.ensure_ip("203.0.113.21", now);
+        add_proto_connections(
+            &mut graph,
+            source,
+            target,
+            5,
+            "malformed packet header",
+            now,
+        );
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_proto_anomaly_aggregated(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::Medium);
+        assert_eq!(incidents[0].evidence["anomaly_count"], 5);
+    }
+
+    #[test]
+    fn detect_proto_anomaly_fires_high_at_high_threshold() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(200);
+        let source = graph.ensure_ip("203.0.113.30", now);
+        let target = graph.ensure_ip("203.0.113.31", now);
+        add_proto_connections(
+            &mut graph,
+            source,
+            target,
+            10,
+            "invalid protocol preface",
+            now,
+        );
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_proto_anomaly_aggregated(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert_eq!(incidents[0].evidence["anomaly_count"], 10);
+    }
+
+    #[test]
+    fn detect_proto_anomaly_ignores_below_threshold_noise() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(200);
+        let source = graph.ensure_ip("203.0.113.40", now);
+        let target = graph.ensure_ip("203.0.113.41", now);
+        add_proto_connections(
+            &mut graph,
+            source,
+            target,
+            4,
+            "malformed packet header",
+            now,
+        );
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_proto_anomaly_aggregated(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn detect_port_scan_fires_for_ten_distinct_ports() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(300);
+        let source = graph.ensure_ip("203.0.113.50", now);
+        for port in 1..=10 {
+            let target = graph.ensure_port(port, "tcp");
+            graph.add_edge(Edge::new(source, target, Relation::ScannedPort, now));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_port_scan(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::Medium);
+        assert_eq!(incidents[0].evidence["distinct_ports"], 10);
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1046"));
+    }
+
+    #[test]
+    fn detect_port_scan_ignores_below_threshold() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(300);
+        let source = graph.ensure_ip("203.0.113.60", now);
+        for port in 1..=9 {
+            let target = graph.ensure_port(port, "tcp");
+            graph.add_edge(Edge::new(source, target, Relation::ScannedPort, now));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_port_scan(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+}
