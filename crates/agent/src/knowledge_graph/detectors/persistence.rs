@@ -307,3 +307,144 @@ pub(super) fn detect_sudo_abuse(
     }
     incidents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("test timestamp must be valid")
+    }
+
+    #[test]
+    fn detect_persistence_fires_for_systemd_write() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let process = graph.ensure_process(1234, 1, "payload", 1000, now);
+        let file = graph.ensure_file("/etc/systemd/system/backdoor.service");
+        graph.add_edge(Edge::new(process, file, Relation::Wrote, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_persistence(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert!(incidents[0].title.contains("Persistence"));
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1543.002"));
+    }
+
+    #[test]
+    fn detect_persistence_ignores_non_persistence_write() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let process = graph.ensure_process(1234, 1, "payload", 1000, now);
+        let file = graph.ensure_file("/tmp/harmless.txt");
+        graph.add_edge(Edge::new(process, file, Relation::Wrote, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_persistence(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn detect_service_stop_fires_for_security_service_disable() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let systemctl = graph.ensure_process(42, 1, "systemctl", 0, now);
+        graph.add_edge(
+            Edge::new(systemctl, systemctl, Relation::Executed, now)
+                .with_prop("summary", "systemctl disable auditd"),
+        );
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_service_stop(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::Critical);
+        assert_eq!(incidents[0].evidence["service"], "auditd");
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1562.001"));
+    }
+
+    #[test]
+    fn detect_service_stop_ignores_non_stop_actions() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let systemctl = graph.ensure_process(42, 1, "systemctl", 0, now);
+        graph.add_edge(
+            Edge::new(systemctl, systemctl, Relation::Executed, now)
+                .with_prop("summary", "systemctl status auditd"),
+        );
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_service_stop(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn detect_log_tampering_fires_for_nonstandard_log_delete() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let process = graph.ensure_process(77, 1, "cleanup", 1000, now);
+        let file = graph.ensure_file("/var/log/auth.log");
+        graph.add_edge(Edge::new(process, file, Relation::Deleted, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_log_tampering(&graph, &mut state, "host", now);
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert_eq!(incidents[0].evidence["action"], "Deleted");
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1070.002"));
+    }
+
+    #[test]
+    fn detect_log_tampering_ignores_trusted_log_writer() {
+        let mut graph = KnowledgeGraph::new();
+        let now = ts(600);
+        let rsyslog = graph.ensure_process(77, 1, "rsyslog", 0, now);
+        let file = graph.ensure_file("/var/log/syslog");
+        graph.add_edge(Edge::new(rsyslog, file, Relation::Wrote, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_log_tampering(&graph, &mut state, "host", now);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn detect_sudo_abuse_fires_for_ten_sudo_edges_in_window() {
+        let mut graph = KnowledgeGraph::new();
+        let user = graph.ensure_user("attacker");
+        for i in 0..10 {
+            let at = ts(i * 5);
+            let process = graph.ensure_process(1000 + i as u32, 1, "sudo", 0, at);
+            graph.add_edge(Edge::new(process, user, Relation::SudoAs, at));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_sudo_abuse(&graph, &mut state, "host", ts(55));
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert_eq!(incidents[0].evidence["sudo_count"], 10);
+        assert!(incidents[0].tags.iter().any(|tag| tag == "T1548.003"));
+    }
+
+    #[test]
+    fn detect_sudo_abuse_ignores_bursts_below_threshold() {
+        let mut graph = KnowledgeGraph::new();
+        let user = graph.ensure_user("operator");
+        for i in 0..9 {
+            let at = ts(i * 5);
+            let process = graph.ensure_process(1000 + i as u32, 1, "sudo", 0, at);
+            graph.add_edge(Edge::new(process, user, Relation::SudoAs, at));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_sudo_abuse(&graph, &mut state, "host", ts(55));
+
+        assert!(incidents.is_empty());
+    }
+}

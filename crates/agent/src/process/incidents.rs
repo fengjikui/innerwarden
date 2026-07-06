@@ -170,6 +170,38 @@ pub(crate) async fn process_incidents(
         process_telegram_approval(approval, data_dir, cfg, state).await;
     }
 
+    // Issue #71: drain dashboard 2FA approve/deny outcomes. Converts each
+    // outcome to an ApprovalResult so we can reuse process_telegram_approval,
+    // which handles pending_confirmations lookup and action execution.
+    let dashboard_outcomes: Vec<crate::dashboard::state::DashboardApprovalOutcome> = {
+        let mut results = Vec::new();
+        if let Some(rx) = state.dashboard_approval_rx.as_mut() {
+            while let Ok(r) = rx.try_recv() {
+                results.push(r);
+            }
+        }
+        results
+    };
+    for outcome in dashboard_outcomes {
+        // CWE-532: log the TOTP-verified flag (not the raw code) so the
+        // audit trail shows whether 2FA was enforced for this decision.
+        tracing::info!(
+            incident_id = %outcome.incident_id,
+            approved = %outcome.approved,
+            operator = %outcome.operator,
+            totp_verified = %outcome.totp_verified,
+            "dashboard approval outcome received",
+        );
+        let approval = telegram::ApprovalResult {
+            incident_id: outcome.incident_id,
+            approved: outcome.approved,
+            operator_name: outcome.operator,
+            always: false,
+            chosen_action: String::new(),
+        };
+        process_telegram_approval(approval, data_dir, cfg, state).await;
+    }
+
     // Expire stale pending confirmations and honeypot choices
     let now = chrono::Utc::now();
     state

@@ -191,6 +191,10 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -493,6 +497,10 @@ async fn golden_path_dry_run_produces_decision_entry() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -693,6 +701,10 @@ async fn allowed_skills_whitelist_enforced() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -874,6 +886,10 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1056,6 +1072,10 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1223,6 +1243,10 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1400,6 +1424,10 @@ async fn decision_cooldown_suppresses_repeat() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),

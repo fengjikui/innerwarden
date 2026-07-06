@@ -754,6 +754,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         None
     };
 
+    // Issue #71: create the shared bridge before the dashboard spawn so
+    // both the spawn closure and AgentState can each take a handle.
+    // Declared here (before the dashboard gate) so AgentState init at the
+    // bottom of this function can always reference them, even when the
+    // dashboard is disabled (the sender is simply dropped).
+    let dashboard_pending_map: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::telegram::PendingConfirmation>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let (dashboard_approval_tx, dashboard_approval_rx) =
+        tokio::sync::mpsc::channel::<crate::dashboard::state::DashboardApprovalOutcome>(32);
+
     // Dashboard spawn is gated by both the CLI flag AND the config
     // toggle. CLI `--dashboard` is the historical opt-in; the config
     // field (default `true`) lets the operator switch the dashboard
@@ -853,6 +864,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let tls_cert = cli.tls_cert.clone();
         let tls_key = cli.tls_key.clone();
         let insecure_no_tls = cli.insecure_no_tls;
+
         // PR #420 Wave 3: thread 2FA config into the dashboard so the
         // sensitive POST endpoints (orphan clear / mark-already-gone)
         // can gate on operator-provided TOTP codes. `[security]` is
@@ -906,6 +918,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             }
         }
 
+        // Clone the Arc before moving into the spawn closure so
+        // AgentState init below can still hold the original handle.
+        let dashboard_pending_for_serve = dashboard_pending_map.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -933,6 +948,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 insecure_no_tls,
                 dashboard_two_factor,
                 dashboard_playbook_sim,
+                dashboard_pending_for_serve,
+                dashboard_approval_tx,
             )
             .await
             {
@@ -1313,6 +1330,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         telegram_client,
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
+        dashboard_pending: dashboard_pending_map.clone(),
+        dashboard_approval_rx: Some(dashboard_approval_rx),
         grouping_engine: notification_pipeline::GroupingEngine::new(&cfg.notifications),
         environment_profile: {
             // 2026-05-03: load auto-detected profile, then merge in

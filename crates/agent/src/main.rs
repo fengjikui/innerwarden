@@ -721,6 +721,16 @@ struct AgentState {
     latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
+    /// Issue #71: shared map bridging the agent loop and dashboard 2FA endpoints.
+    /// Populated by `decision_confirmation.rs` when a pending confirmation is created;
+    /// the dashboard `/api/2fa/pending` handler reads from it.
+    dashboard_pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::telegram::PendingConfirmation>>,
+    >,
+    /// Issue #71: receives approve/deny outcomes from the dashboard 2FA endpoints.
+    /// Drained at the start of every incident tick, parallel to `approval_rx`.
+    dashboard_approval_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::dashboard::state::DashboardApprovalOutcome>>,
     /// Knowledge graph — in-memory directed graph for attack context (shared with dashboard).
     knowledge_graph: std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
     /// Graph-based detector state (cooldowns).

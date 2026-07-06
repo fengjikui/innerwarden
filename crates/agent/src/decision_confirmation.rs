@@ -9,44 +9,33 @@ pub(crate) async fn execute_request_confirmation(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> (String, bool) {
-    // T.2 - send inline keyboard approval request via Telegram when enabled.
-    let tg = state.telegram_client.clone();
     let req_detector = crate::agent_context::incident_detector(&incident.incident_id).to_string();
     let req_action = decision.action.name();
-    if let Some(tg) = tg {
-        let ttl = cfg.telegram.approval_ttl_secs;
+    let ttl = cfg.telegram.approval_ttl_secs;
+    let now = chrono::Utc::now();
+
+    // T.2 - send an inline-keyboard approval request via Telegram when enabled.
+    // Capture the message id so the Telegram callback can edit the message; it
+    // stays 0 when no Telegram message is sent (dashboard-only deployments).
+    let mut telegram_message_id = 0;
+    let mut channel: Option<&str> = None;
+    if let Some(tg) = state.telegram_client.clone() {
         match tg
             .send_confirmation_request(incident, summary, req_action, decision.confidence, ttl)
             .await
         {
             Ok(msg_id) => {
-                let now = chrono::Utc::now();
-                let pending = telegram::PendingConfirmation {
-                    incident_id: incident.incident_id.clone(),
-                    telegram_message_id: msg_id,
-                    action_description: summary.to_string(),
-                    created_at: now,
-                    expires_at: now + chrono::Duration::seconds(ttl as i64),
-                    detector: req_detector,
-                    action_name: req_action.to_string(),
-                };
-                state.pending_confirmations.insert(
-                    incident.incident_id.clone(),
-                    (pending, decision.clone(), incident.clone()),
-                );
-                return (
-                    "pending: operator confirmation requested via Telegram".to_string(),
-                    false,
-                );
+                telegram_message_id = msg_id;
+                channel = Some("Telegram");
             }
-            Err(e) => {
-                tracing::warn!("Telegram confirmation request failed: {e:#}");
-            }
+            Err(e) => tracing::warn!("Telegram confirmation request failed: {e:#}"),
         }
     }
 
-    // Fallback: webhook notification when Telegram is not configured.
-    if cfg.webhook.enabled && !cfg.webhook.url.is_empty() {
+    // Fallback notification: webhook when Telegram did not deliver. Best-effort -
+    // a failed webhook must NOT drop the confirmation, which is still registered
+    // below for dashboard approval.
+    if channel.is_none() && cfg.webhook.enabled && !cfg.webhook.url.is_empty() {
         let payload = serde_json::json!({
             "type": "confirmation_required",
             "incident_id": incident.incident_id,
@@ -55,15 +44,39 @@ pub(crate) async fn execute_request_confirmation(
         });
         let client = reqwest::Client::new();
         match client.post(&cfg.webhook.url).json(&payload).send().await {
-            Ok(_) => ("confirmation request sent via webhook".to_string(), false),
-            Err(e) => (format!("confirmation webhook failed: {e}"), false),
+            Ok(_) => channel = Some("webhook"),
+            Err(e) => tracing::warn!("confirmation webhook failed: {e}"),
         }
-    } else {
-        (
-            "confirmation requested (no Telegram or webhook configured)".to_string(),
-            false,
-        )
     }
+
+    // Issue #71: register the pending confirmation so BOTH the Telegram callback
+    // AND the dashboard 2FA endpoints can approve/deny it, independent of the
+    // notification channel. This registration previously lived only inside the
+    // Telegram-success branch, so a dashboard-only operator (no Telegram) got an
+    // always-empty pending list and could never approve anything.
+    let pending = telegram::PendingConfirmation {
+        incident_id: incident.incident_id.clone(),
+        telegram_message_id,
+        action_description: summary.to_string(),
+        created_at: now,
+        expires_at: now + chrono::Duration::seconds(ttl as i64),
+        detector: req_detector,
+        action_name: req_action.to_string(),
+    };
+    if let Ok(mut map) = state.dashboard_pending.lock() {
+        map.insert(incident.incident_id.clone(), pending.clone());
+    }
+    state.pending_confirmations.insert(
+        incident.incident_id.clone(),
+        (pending, decision.clone(), incident.clone()),
+    );
+
+    let status = match channel {
+        Some("Telegram") => "pending: confirmation requested via Telegram (dashboard-approvable)",
+        Some("webhook") => "pending: confirmation sent via webhook (dashboard-approvable)",
+        _ => "pending: confirmation registered for dashboard approval",
+    };
+    (status.to_string(), false)
 }
 
 #[cfg(test)]
@@ -87,7 +100,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_local_pending_message_without_telegram_or_webhook() {
+    async fn registers_pending_for_dashboard_without_telegram_or_webhook() {
+        // Issue #71 regression: on a dashboard-only deployment (no Telegram, no
+        // webhook) the confirmation MUST still be registered so the dashboard
+        // 2FA endpoints have something to approve. Previously the maps were only
+        // populated on the Telegram-success path, leaving the dashboard blind.
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let cfg = config::AgentConfig::default();
@@ -104,10 +121,20 @@ mod tests {
 
         assert_eq!(
             status,
-            "confirmation requested (no Telegram or webhook configured)"
+            "pending: confirmation registered for dashboard approval"
         );
         assert!(!pushed);
-        assert!(state.pending_confirmations.is_empty());
+        // Registered in BOTH the internal map (for execution) and the
+        // dashboard-visible map (for /api/2fa/pending).
+        assert!(state
+            .pending_confirmations
+            .contains_key(&incident.incident_id));
+        let dash = state.dashboard_pending.lock().expect("lock");
+        assert!(dash.contains_key(&incident.incident_id));
+        assert_eq!(
+            dash[&incident.incident_id].telegram_message_id, 0,
+            "no Telegram message id on a dashboard-only registration"
+        );
     }
 
     #[tokio::test]
@@ -144,8 +171,16 @@ mod tests {
         .await;
 
         server.await.expect("server task");
-        assert_eq!(status, "confirmation request sent via webhook");
+        assert_eq!(
+            status,
+            "pending: confirmation sent via webhook (dashboard-approvable)"
+        );
         assert!(!pushed);
+        // The confirmation is registered for dashboard approval even on the
+        // webhook path (issue #71).
+        assert!(state
+            .pending_confirmations
+            .contains_key(&incident.incident_id));
     }
 
     #[tokio::test]
@@ -167,7 +202,15 @@ mod tests {
         )
         .await;
 
-        assert!(status.starts_with("confirmation webhook failed:"));
+        // A failed webhook is best-effort: it must NOT drop the confirmation.
+        // The action stays registered for dashboard approval (issue #71).
+        assert_eq!(
+            status,
+            "pending: confirmation registered for dashboard approval"
+        );
         assert!(!pushed);
+        assert!(state
+            .pending_confirmations
+            .contains_key(&incident.incident_id));
     }
 }

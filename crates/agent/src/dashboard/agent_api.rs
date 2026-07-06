@@ -2439,6 +2439,10 @@ enabled = false
             fleet_state: None,
             two_factor: std::sync::Arc::new(crate::dashboard::TwoFactorSettings::default()),
             playbook_sim: std::sync::Arc::new(crate::dashboard::PlaybookSimContext::default()),
+            pending_approvals: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            approval_outcome_tx: None,
         }
     }
 
