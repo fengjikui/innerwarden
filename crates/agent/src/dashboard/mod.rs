@@ -36,6 +36,7 @@ mod sensors;
 mod sse;
 mod still_active_now;
 mod threat_contract;
+mod two_fa;
 
 #[cfg(test)]
 mod consistency_block_counts;
@@ -70,6 +71,8 @@ use push::*;
 use sensors::*;
 #[allow(unused_imports)]
 use sse::*;
+#[allow(unused_imports)]
+use two_fa::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -466,6 +469,10 @@ pub async fn serve(
     insecure_no_tls: bool,
     two_factor: state::TwoFactorSettings,
     playbook_sim: state::PlaybookSimContext,
+    // Issue #71: shared pending map (bridge between agent loop and dashboard).
+    pending_approvals: Arc<Mutex<HashMap<String, crate::telegram::PendingConfirmation>>>,
+    // Issue #71: channel to notify the agent loop of approve/deny outcomes.
+    approval_outcome_tx: tokio::sync::mpsc::Sender<state::DashboardApprovalOutcome>,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
     let is_loopback_bind = is_loopback_address(&bind);
@@ -576,6 +583,8 @@ pub async fn serve(
         fleet_state,
         two_factor: Arc::new(two_factor),
         playbook_sim: Arc::new(playbook_sim),
+        pending_approvals,
+        approval_outcome_tx: Some(approval_outcome_tx),
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -586,6 +595,8 @@ pub async fn serve(
         ),
         require_auth,
     );
+    // Issue #71: clone before `state` is moved into the router builders below.
+    let cleanup_pending_approvals = state.pending_approvals.clone();
     let activity_state = state.last_activity.clone();
     let activity_layer = middleware::from_fn(move |req: Request<Body>, next: Next| {
         let ts = activity_state.clone();
@@ -821,6 +832,10 @@ pub async fn serve(
             "/api/push/subscribe",
             post(api_push_subscribe).delete(api_push_unsubscribe),
         )
+        // Issue #71: Dashboard 2FA approval endpoints
+        .route("/api/2fa/pending", get(api_2fa_pending))
+        .route("/api/2fa/approve/:approval_id", post(api_2fa_approve))
+        .route("/api/2fa/deny/:approval_id", post(api_2fa_deny))
         // Session management endpoints (auth-protected)
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
@@ -899,7 +914,7 @@ pub async fn serve(
         }
     });
 
-    // Session + advisory cleanup: remove expired entries every 60 seconds
+    // Session + advisory + pending-approval cleanup: remove expired entries every 60 seconds
     let cleanup_sessions = sessions;
     let cleanup_timeout = session_timeout_minutes;
     let cleanup_advisory_cache = advisory_cache.clone();
@@ -913,6 +928,15 @@ pub async fn serve(
             if let Ok(mut cache) = cleanup_advisory_cache.write() {
                 let cutoff = Utc::now() - chrono::Duration::hours(1);
                 cache.retain(|e| e.ts > cutoff);
+            }
+            // Issue #71: evict expired 2FA approval requests so the map
+            // does not grow unbounded when the operator never acts on them.
+            {
+                let now = Utc::now();
+                let mut approvals = cleanup_pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                approvals.retain(|_, pc| pc.expires_at > now);
             }
         }
     });
@@ -7190,6 +7214,8 @@ mod tests {
             true,
             state::TwoFactorSettings::default(),
             state::PlaybookSimContext::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tokio::sync::mpsc::channel::<state::DashboardApprovalOutcome>(1).0,
         )
         .await;
 
